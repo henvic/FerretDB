@@ -25,9 +25,12 @@ import (
 	"github.com/FerretDB/FerretDB/internal/backends"
 	"github.com/FerretDB/FerretDB/internal/handler/common"
 	"github.com/FerretDB/FerretDB/internal/handler/handlererrors"
+	"github.com/FerretDB/FerretDB/internal/handler/handlerparams"
 	"github.com/FerretDB/FerretDB/internal/types"
+	"github.com/FerretDB/FerretDB/internal/util/iterator"
 	"github.com/FerretDB/FerretDB/internal/util/lazyerrors"
 	"github.com/FerretDB/FerretDB/internal/util/must"
+	"github.com/FerretDB/FerretDB/internal/util/password"
 	"github.com/FerretDB/FerretDB/internal/wire"
 )
 
@@ -118,36 +121,99 @@ func (h *Handler) MsgCreateUser(ctx context.Context, msg *wire.OpMsg) (*wire.OpM
 		"SCRAM-SHA-256": {},
 	}
 
+	var scramSHA256 bool
 	for _, mechanism := range mechanisms.([]string) {
 		if _, ok := supportedMechanisms[mechanism]; !ok {
 			return nil, lazyerrors.Errorf("unsupported mechanism %s", mechanism)
 		}
+		if mechanism == "SCRAM-SHA-256" {
+			scramSHA256 = true
+		}
 	}
 
-	password, err := document.Get("pwd")
-	must.NoError(err)
+	pwdi := must.NotFail(document.Get("pwd"))
+	pwd, ok := pwdi.(string)
 
-	// ignore the authzID
-	scramClient, err := scram.SHA256.NewClient(username, password.(string), "")
-	must.NoError(err)
+	if !ok {
+		return nil, handlererrors.NewCommandErrorMsg(
+			handlererrors.ErrTypeMismatch,
+			fmt.Sprintf("BSON field 'createUser.pwd' is the wrong type '%s', expected type 'string'",
+				handlerparams.AliasFromType(pwdi),
+			),
+		)
+	}
 
-	// https://datatracker.ietf.org/doc/html/rfc5802#section-3
-	// XXX local authorization stores users and their respective roles in the database
-	// we most likely need to generate the SHA-1 and SHA-256 credentials ourselves
-	// instead of relying on a full authentication exchange
-	_ = scramClient
+	if pwd == "" {
+		return nil, handlererrors.NewCommandErrorMsg(
+			handlererrors.ErrSetEmptyPassword,
+			"Password cannot be empty",
+		)
+	}
+
+	if scramSHA256 {
+		// ignore the authzID
+		scramClient, err := scram.SHA256.NewClient(username, pwd, "")
+		must.NoError(err)
+
+		// https://datatracker.ietf.org/doc/html/rfc5802#section-3
+		// XXX local authorization stores users and their respective roles in the database
+		// we most likely need to generate the SHA-1 and SHA-256 credentials ourselves
+		// instead of relying on a full authentication exchange
+		_ = scramClient
+
+	}
+
+	defMechanisms := must.NotFail(types.NewArray())
+	mechanismsParam, err := common.GetOptionalParam(document, "mechanisms", defMechanisms)
+	if err != nil {
+		return nil, lazyerrors.Error(err)
+	}
+
+	var plainAuth bool
+
+	if mechanisms != nil {
+		iter := mechanismsParam.Iterator()
+		defer iter.Close()
+
+		for {
+			var v any
+			_, v, err = iter.Next()
+
+			if errors.Is(err, iterator.ErrIteratorDone) {
+				break
+			}
+
+			if err != nil {
+				return nil, lazyerrors.Error(err)
+			}
+
+			if v != "PLAIN" {
+				return nil, handlererrors.NewCommandErrorMsg(
+					handlererrors.ErrBadValue,
+					fmt.Sprintf("Unknown auth mechanism '%s'", v),
+				)
+			}
+
+			plainAuth = true
+		}
+	}
+
+	credentials := types.MakeDocument(0)
+
+	if plainAuth {
+		credentials.Set("PLAIN", must.NotFail(password.PlainHash(pwd)))
+	}
 
 	id := uuid.New()
 	saved := must.NotFail(types.NewDocument(
 		"_id", dbName+"."+username,
-		"credentials", types.MakeDocument(0),
+		"credentials", credentials,
 		"user", username,
 		"db", dbName,
 		"roles", types.MakeArray(0),
 		"userId", types.Binary{Subtype: types.BinaryUUID, B: must.NotFail(id.MarshalBinary())},
 	))
 
-	// Users are saved in the "admin" database.
 	adminDB, err := h.b.Database("admin")
 	if err != nil {
 		return nil, lazyerrors.Error(err)
