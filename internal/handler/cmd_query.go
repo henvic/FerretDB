@@ -43,7 +43,7 @@ func (h *Handler) CmdQuery(ctx context.Context, query *wire.OpQuery) (*wire.OpRe
 	// to reduce connection overhead time, clients may use a hello command to complete their authentication exchange
 	// if so, the saslStart command may be embedded under the speculativeAuthenticate field
 	if (cmd == "ismaster" || cmd == "hello") && doc.Has("speculativeAuthenticate") {
-		reply, err := common.IsMaster(ctx, doc)
+		reply, err := common.IsMaster(ctx, doc, h.TCPHost, h.ReplSetName)
 		must.NoError(err)
 
 		speculativeAuthenticate, err := doc.Get("speculativeAuthenticate")
