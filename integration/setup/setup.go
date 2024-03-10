@@ -17,6 +17,7 @@ package setup
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net/url"
@@ -32,6 +33,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/FerretDB/FerretDB/integration/shareddata"
+	"github.com/FerretDB/FerretDB/internal/handler/handlererrors"
 	"github.com/FerretDB/FerretDB/internal/util/iterator"
 	"github.com/FerretDB/FerretDB/internal/util/observability"
 	"github.com/FerretDB/FerretDB/internal/util/testutil"
@@ -339,6 +341,15 @@ func setupUser(tb testtb.TB, ctx context.Context, client *mongo.Client, uri stri
 	username, password := "username", "password"
 
 	err := client.Database("admin").RunCommand(ctx, bson.D{
+		{"dropUser", username},
+	}).Err()
+
+	var ce mongo.CommandError
+	if errors.As(err, &ce) && ce.Code != int32(handlererrors.ErrUserNotFound) {
+		require.NoError(tb, err, "cannot drop user")
+	}
+
+	err = client.Database("admin").RunCommand(ctx, bson.D{
 		{"createUser", username},
 		{"roles", bson.A{}},
 		{"pwd", password},
